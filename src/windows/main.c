@@ -126,29 +126,54 @@ static WCHAR *get_session_username(DWORD sessionId)
 /*  Build a command line string from argv-style arguments                     */
 /* -------------------------------------------------------------------------- */
 
+/*
+ * Build a correctly-quoted command line string from an argv array.
+ *
+ * Follows the escaping rules consumed by CommandLineToArgvW:
+ *   - Arguments containing spaces, tabs, or double-quotes are wrapped in "...".
+ *   - Inside quotes, backslashes are literal UNLESS followed by a double-quote:
+ *       * 2n   backslashes + "  →  n literal backslashes, quote ends/begins
+ *       * 2n+1 backslashes + "  →  n literal backslashes + literal "
+ *   - Trailing backslashes before the closing quote must be doubled so they
+ *     don't escape it (e.g. arg  C:\path\  →  "C:\path\\"  not  "C:\path\").
+ *   - Empty arguments are quoted as "".
+ */
 static WCHAR *build_command_line(int argc, wchar_t *argv[])
 {
     /* First pass: calculate required buffer size */
     size_t totalLen = 0;
     for (int i = 0; i < argc; i++) {
-        BOOL needsQuoting = FALSE;
         const WCHAR *arg = argv[i];
+        BOOL needsQuoting = FALSE;
 
-        for (const WCHAR *p = arg; *p; p++) {
-            if (*p == L' ' || *p == L'\t' || *p == L'"') {
-                needsQuoting = TRUE;
-                break;
+        if (arg[0] == L'\0') {
+            needsQuoting = TRUE;      /* empty args must be quoted */
+        } else {
+            for (const WCHAR *p = arg; *p; p++) {
+                if (*p == L' ' || *p == L'\t' || *p == L'"') {
+                    needsQuoting = TRUE;
+                    break;
+                }
             }
         }
 
         if (needsQuoting) {
             totalLen += 2; /* surrounding quotes */
+            size_t numBackslashes = 0;
             for (const WCHAR *p = arg; *p; p++) {
-                if (*p == L'"')
-                    totalLen += 2; /* escaped quote: \" */
-                else
-                    totalLen += 1;
+                if (*p == L'\\') {
+                    numBackslashes++;
+                } else if (*p == L'"') {
+                    /* Double preceding backslashes + backslash-quote */
+                    totalLen += numBackslashes + 1;
+                    numBackslashes = 0;
+                } else {
+                    numBackslashes = 0;
+                }
+                totalLen += 1; /* the character itself */
             }
+            /* Trailing backslashes are doubled before the closing quote */
+            totalLen += numBackslashes;
         } else {
             totalLen += wcslen(arg);
         }
@@ -169,23 +194,39 @@ static WCHAR *build_command_line(int argc, wchar_t *argv[])
         const WCHAR *arg = argv[i];
         BOOL needsQuoting = FALSE;
 
-        for (const WCHAR *p = arg; *p; p++) {
-            if (*p == L' ' || *p == L'\t' || *p == L'"') {
-                needsQuoting = TRUE;
-                break;
+        if (arg[0] == L'\0') {
+            needsQuoting = TRUE;
+        } else {
+            for (const WCHAR *p = arg; *p; p++) {
+                if (*p == L' ' || *p == L'\t' || *p == L'"') {
+                    needsQuoting = TRUE;
+                    break;
+                }
             }
         }
 
         if (needsQuoting) {
             *dst++ = L'"';
+            size_t numBackslashes = 0;
             for (const WCHAR *p = arg; *p; p++) {
-                if (*p == L'"') {
+                if (*p == L'\\') {
+                    numBackslashes++;
+                    *dst++ = L'\\';
+                } else if (*p == L'"') {
+                    /* Double the preceding backslashes, then emit \" */
+                    for (size_t j = 0; j < numBackslashes; j++)
+                        *dst++ = L'\\';
                     *dst++ = L'\\';
                     *dst++ = L'"';
+                    numBackslashes = 0;
                 } else {
+                    numBackslashes = 0;
                     *dst++ = *p;
                 }
             }
+            /* Double trailing backslashes before the closing quote */
+            for (size_t j = 0; j < numBackslashes; j++)
+                *dst++ = L'\\';
             *dst++ = L'"';
         } else {
             size_t len = wcslen(arg);

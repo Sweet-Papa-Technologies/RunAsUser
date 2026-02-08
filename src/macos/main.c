@@ -207,9 +207,33 @@ static int drop_privileges(const struct passwd *pw)
 
 /*
  * Set a clean environment for the target user.
+ *
+ * The inherited environment is cleared entirely before setting user
+ * variables.  Without this, every variable from the root/calling process
+ * leaks into the child — including possible secrets (API keys, tokens)
+ * and variables that can influence runtime behaviour
+ * (DYLD_FRAMEWORK_PATH, PYTHONPATH, LD_PRELOAD, etc.).
  */
 static void setup_environment(const struct passwd *pw)
 {
+    extern char **environ;
+
+    /* Strip the inherited environment completely */
+    while (environ != NULL && environ[0] != NULL) {
+        const char *entry = environ[0];
+        const char *eq = strchr(entry, '=');
+        if (!eq)
+            break;   /* malformed entry — stop to avoid infinite loop */
+
+        size_t len = (size_t)(eq - entry);
+        char *name = strndup(entry, len);
+        if (!name)
+            break;
+        unsetenv(name);
+        free(name);
+    }
+
+    /* Build a minimal, known-safe environment */
     setenv("HOME",    pw->pw_dir,   1);
     setenv("USER",    pw->pw_name,  1);
     setenv("LOGNAME", pw->pw_name,  1);
