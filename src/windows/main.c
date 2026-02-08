@@ -82,28 +82,78 @@ static void print_message(const WCHAR *message)
 
 static BOOL find_active_session(DWORD *pSessionId)
 {
-    /* Try the fast path first: the physical console session */
-    DWORD sessionId = WTSGetActiveConsoleSessionId();
-    if (sessionId != 0xFFFFFFFF) {
-        *pSessionId = sessionId;
-        return TRUE;
-    }
+    /*
+     * We need to find a session that actually has a logged-in user.
+     * WTSGetActiveConsoleSessionId() returns the physical console session ID,
+     * but that session may not have a user token (e.g., screen locked, user
+     * connected via RDP, or no user logged in at the console).
+     *
+     * Strategy:
+     *   1. Enumerate all sessions.
+     *   2. For each Active session (skip session 0 = services), try
+     *      WTSQueryUserToken to verify a user is actually present.
+     *   3. Prefer the physical console session if it works.
+     *   4. Fall back to any other active session with a valid token (RDP, etc.).
+     *   5. Try disconnected sessions (user logged in but session disconnected).
+     */
 
-    /* Fallback: enumerate all sessions, pick the first active one (covers RDP) */
     WTS_SESSION_INFOW *pSessions = NULL;
     DWORD count = 0;
+    DWORD consoleSessionId = WTSGetActiveConsoleSessionId();
 
     if (!WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1,
                                &pSessions, &count)) {
+        /* Enumeration failed; last resort: try the console session blindly */
+        if (consoleSessionId != 0xFFFFFFFF) {
+            *pSessionId = consoleSessionId;
+            return TRUE;
+        }
         return FALSE;
     }
 
     BOOL found = FALSE;
-    for (DWORD i = 0; i < count; i++) {
-        if (pSessions[i].State == WTSActive) {
-            *pSessionId = pSessions[i].SessionId;
-            found = TRUE;
-            break;
+    HANDLE hTestToken = NULL;
+
+    /* Pass 1: Prefer the console session if it's Active and has a user token */
+    if (consoleSessionId != 0xFFFFFFFF && consoleSessionId != 0) {
+        for (DWORD i = 0; i < count; i++) {
+            if (pSessions[i].SessionId == consoleSessionId &&
+                pSessions[i].State == WTSActive) {
+                if (WTSQueryUserToken(consoleSessionId, &hTestToken)) {
+                    CloseHandle(hTestToken);
+                    *pSessionId = consoleSessionId;
+                    found = TRUE;
+                }
+                break;
+            }
+        }
+    }
+
+    /* Pass 2: Any Active session (covers RDP, Fast User Switching, etc.) */
+    if (!found) {
+        for (DWORD i = 0; i < count; i++) {
+            if (pSessions[i].State == WTSActive && pSessions[i].SessionId != 0) {
+                if (WTSQueryUserToken(pSessions[i].SessionId, &hTestToken)) {
+                    CloseHandle(hTestToken);
+                    *pSessionId = pSessions[i].SessionId;
+                    found = TRUE;
+                    break;
+                }
+            }
+        }
+    }
+
+    /* Pass 3: Disconnected sessions (user logged in but session disconnected) */
+    if (!found) {
+        for (DWORD i = 0; i < count; i++) {
+            if (pSessions[i].State == WTSDisconnected && pSessions[i].SessionId != 0) {
+                if (WTSQueryUserToken(pSessions[i].SessionId, &hTestToken)) {
+                    CloseHandle(hTestToken);
+                    *pSessionId = pSessions[i].SessionId;
+                    found = TRUE;
+                    break;
+                }
+            }
         }
     }
 
