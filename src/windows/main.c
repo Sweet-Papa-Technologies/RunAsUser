@@ -4,6 +4,9 @@
  * Must be run as SYSTEM (NT AUTHORITY\SYSTEM). Finds the active user session,
  * obtains their token, and launches the requested command in the user's context.
  *
+ * When --wait is used, the child's stdout/stderr are piped back through this
+ * process so the caller can capture the output.
+ *
  * Exit codes:
  *   0              - Success (process created, no --wait)
  *   Child's code   - Success (with --wait)
@@ -35,6 +38,8 @@
 #define EXIT_TOKEN_FAILURE      3
 #define EXIT_PROCESS_FAILURE    4
 #define EXIT_USAGE_ERROR        5
+
+#define PIPE_BUFFER_SIZE        4096
 
 /* -------------------------------------------------------------------------- */
 /*  Error reporting                                                           */
@@ -243,6 +248,80 @@ static WCHAR *build_command_line(int argc, wchar_t *argv[])
 }
 
 /* -------------------------------------------------------------------------- */
+/*  Pipe forwarding: read from pipe handle, write to local file handle        */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * Forward all data from a pipe read-end to a local output handle (stdout/stderr).
+ * Reads until the pipe is broken (child process exits and closes its end).
+ */
+static void forward_pipe(HANDLE hPipeRead, HANDLE hOutput)
+{
+    char buffer[PIPE_BUFFER_SIZE];
+    DWORD bytesRead;
+
+    while (ReadFile(hPipeRead, buffer, sizeof(buffer), &bytesRead, NULL)) {
+        if (bytesRead == 0)
+            break;
+        DWORD bytesWritten;
+        WriteFile(hOutput, buffer, bytesRead, &bytesWritten, NULL);
+    }
+}
+
+/*
+ * Forward pipes on two threads: stdout and stderr from the child.
+ * We forward stderr on a separate thread so both streams drain concurrently
+ * (preventing deadlocks when the child writes to both).
+ */
+typedef struct {
+    HANDLE hPipeRead;
+    HANDLE hOutput;
+} PipeForwardArgs;
+
+static DWORD WINAPI pipe_forward_thread(LPVOID lpParam)
+{
+    PipeForwardArgs *args = (PipeForwardArgs *)lpParam;
+    forward_pipe(args->hPipeRead, args->hOutput);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Create inheritable pipe with non-inheritable read end                     */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * Creates an anonymous pipe where:
+ *   - The WRITE end is inheritable (passed to the child process)
+ *   - The READ end is NOT inheritable (kept by the parent)
+ */
+static BOOL create_pipe_pair(HANDLE *hRead, HANDLE *hWrite)
+{
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;  /* Write end will be inheritable */
+    sa.lpSecurityDescriptor = NULL;
+
+    HANDLE hReadTmp, hWriteTmp;
+    if (!CreatePipe(&hReadTmp, &hWriteTmp, &sa, 0))
+        return FALSE;
+
+    /* Make the read end non-inheritable so the child doesn't hold it open */
+    HANDLE hReadNonInheritable;
+    if (!DuplicateHandle(GetCurrentProcess(), hReadTmp,
+                         GetCurrentProcess(), &hReadNonInheritable,
+                         0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        CloseHandle(hReadTmp);
+        CloseHandle(hWriteTmp);
+        return FALSE;
+    }
+    CloseHandle(hReadTmp);
+
+    *hRead = hReadNonInheritable;
+    *hWrite = hWriteTmp;
+    return TRUE;
+}
+
+/* -------------------------------------------------------------------------- */
 /*  Usage                                                                     */
 /* -------------------------------------------------------------------------- */
 
@@ -254,7 +333,8 @@ static void print_usage(void)
         L"Run a command as the currently logged-in user (must be run as SYSTEM).\n"
         L"\n"
         L"Options:\n"
-        L"  --wait          Wait for the process to exit and propagate its exit code\n"
+        L"  --wait          Wait for the process to exit and propagate its exit code.\n"
+        L"                  stdout/stderr from the child are piped back to the caller.\n"
         L"  --session <id>  Target a specific session ID (default: active console)\n"
         L"\n"
         L"Examples:\n"
@@ -282,6 +362,13 @@ int wmain(int argc, wchar_t *argv[])
     WCHAR *cmdLine          = NULL;
     WCHAR *sessionUser      = NULL;
     WCHAR profileDir[MAX_PATH] = {0};
+
+    /* Pipe handles for stdout/stderr forwarding (used with --wait) */
+    HANDLE hStdoutRead      = NULL;
+    HANDLE hStdoutWrite     = NULL;
+    HANDLE hStderrRead      = NULL;
+    HANDLE hStderrWrite     = NULL;
+    HANDLE hStderrThread    = NULL;
 
     PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof(pi));
@@ -402,7 +489,39 @@ int wmain(int argc, wchar_t *argv[])
     si.cb = sizeof(si);
     si.lpDesktop = L"winsta0\\default"; /* Interactive desktop */
 
-    DWORD creationFlags = CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_CONSOLE;
+    DWORD creationFlags = CREATE_UNICODE_ENVIRONMENT;
+    BOOL inheritHandles = FALSE;
+
+    if (waitForChild) {
+        /*
+         * When --wait is used, we pipe the child's stdout/stderr back through
+         * this process so the caller (e.g., a Node.js service) can capture
+         * the output. We use anonymous pipes with inheritable write ends.
+         *
+         * Without --wait, we give the child its own console (CREATE_NEW_CONSOLE)
+         * so interactive/GUI programs work normally.
+         */
+        if (!create_pipe_pair(&hStdoutRead, &hStdoutWrite)) {
+            print_error(L"failed to create stdout pipe", GetLastError());
+            exitCode = EXIT_GENERAL_FAILURE;
+            goto cleanup;
+        }
+        if (!create_pipe_pair(&hStderrRead, &hStderrWrite)) {
+            print_error(L"failed to create stderr pipe", GetLastError());
+            exitCode = EXIT_GENERAL_FAILURE;
+            goto cleanup;
+        }
+
+        si.dwFlags |= STARTF_USESTDHANDLES;
+        si.hStdInput  = NULL;         /* Child gets no stdin */
+        si.hStdOutput = hStdoutWrite;
+        si.hStdError  = hStderrWrite;
+
+        creationFlags |= CREATE_NO_WINDOW; /* No visible console window */
+        inheritHandles = TRUE;
+    } else {
+        creationFlags |= CREATE_NEW_CONSOLE;
+    }
 
     if (!CreateProcessAsUserW(
             hDupToken,
@@ -410,7 +529,7 @@ int wmain(int argc, wchar_t *argv[])
             cmdLine,                                /* lpCommandLine (mutable) */
             NULL,                                   /* lpProcessAttributes */
             NULL,                                   /* lpThreadAttributes */
-            FALSE,                                  /* bInheritHandles */
+            inheritHandles,                         /* bInheritHandles */
             creationFlags,
             lpEnvironment,
             profileDir[0] ? profileDir : NULL,      /* lpCurrentDirectory */
@@ -433,6 +552,34 @@ int wmain(int argc, wchar_t *argv[])
     /* ---- Step 8: Optionally wait for the child process ------------------ */
 
     if (waitForChild) {
+        /*
+         * Close the write ends of the pipes in the parent process.
+         * This is critical: the child holds the only remaining handles to the
+         * write ends, so when it exits, ReadFile in forward_pipe will see
+         * a broken pipe and return FALSE, ending the forwarding loop.
+         */
+        CloseHandle(hStdoutWrite); hStdoutWrite = NULL;
+        CloseHandle(hStderrWrite); hStderrWrite = NULL;
+
+        /*
+         * Forward the child's stderr on a background thread so we can
+         * forward stdout on the main thread concurrently. This prevents
+         * deadlocks if the child writes to both stdout and stderr.
+         */
+        PipeForwardArgs stderrArgs = { hStderrRead, GetStdHandle(STD_ERROR_HANDLE) };
+        hStderrThread = CreateThread(NULL, 0, pipe_forward_thread, &stderrArgs, 0, NULL);
+
+        /* Forward stdout on the main thread */
+        forward_pipe(hStdoutRead, GetStdHandle(STD_OUTPUT_HANDLE));
+
+        /* Wait for the stderr thread to finish */
+        if (hStderrThread) {
+            WaitForSingleObject(hStderrThread, INFINITE);
+            CloseHandle(hStderrThread);
+            hStderrThread = NULL;
+        }
+
+        /* Wait for the child process to fully exit */
         WaitForSingleObject(pi.hProcess, INFINITE);
 
         DWORD childExitCode = 1;
@@ -449,6 +596,16 @@ int wmain(int argc, wchar_t *argv[])
     /* ---- Cleanup -------------------------------------------------------- */
 
 cleanup:
+    if (hStderrThread)
+        CloseHandle(hStderrThread);
+    if (hStdoutRead)
+        CloseHandle(hStdoutRead);
+    if (hStdoutWrite)
+        CloseHandle(hStdoutWrite);
+    if (hStderrRead)
+        CloseHandle(hStderrRead);
+    if (hStderrWrite)
+        CloseHandle(hStderrWrite);
     if (pi.hThread)
         CloseHandle(pi.hThread);
     if (pi.hProcess)
